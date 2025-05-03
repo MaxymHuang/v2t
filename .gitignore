@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+received_data.bin
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.pcm
+*.raw
+
+# Logs
+*.log
+logs/
+
+# Whisper model cache
+*.pt
+
+# OS specific
+.DS_Store
+Thumbs.db
