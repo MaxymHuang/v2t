@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app and Whisper model
 app = Flask(__name__)
-model = whisper.load_model("tiny")
+model = whisper.load_model("small")
 
 def is_valid_audio(file_path):
     try:

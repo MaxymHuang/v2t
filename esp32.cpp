@@ -6,9 +6,9 @@
 #include <driver/i2s.h>
 
 // Wi-Fi
-const char* ssid      = "gay wifi";
-const char* password  = "31415926";
-const char* serverUrl = "http://10.0.10.98:5000/voice_to_text";
+const char* ssid      = "WIFI_SSID";
+const char* password  = "WIFI_PASSWORD";
+const char* serverUrl = "http://SERVER_IP:PORT/voice_to_text";
 
 // OLED
 #define SCREEN_WIDTH 128
@@ -142,7 +142,6 @@ void loop() {
   // State machine
   switch(state) {
     case IDLE:
-      // Show prompt if desired
       break;
 
     case RECORDING:

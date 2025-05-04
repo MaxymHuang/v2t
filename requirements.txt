@@ -1,2 +1,4 @@
 flask
-faster-whisper
+openai-whisper
+soundfile
+
