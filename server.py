@@ -1,9 +1,9 @@
 from flask import Flask, request, jsonify
 import logging
-import whisper
 import tempfile
 import os
 import soundfile as sf
+from faster_whisper import WhisperModel
 import wave
 
 # Configure logging
@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app and Whisper model
 app = Flask(__name__)
-model = whisper.load_model("small")
+# Initialize faster-whisper model with compute type
+model = WhisperModel("medium", device="cpu", compute_type="int8")
 
 def is_valid_audio(file_path):
     try:
@@ -62,14 +63,21 @@ def voice_to_text():
                     "message": "Invalid or corrupted audio file"
                 }), 400
 
-            # Transcribe the audio using Whisper
-            result = model.transcribe(
+            # Transcribe the audio using faster-whisper with adjusted parameters
+            segments, info = model.transcribe(
                 temp_filename,
-                fp16=False,
-                language='en'
+                language='en',
+                temperature=0.0,  # Start with lowest temperature
+                beam_size=5,      # Increase beam size for better accuracy
+                best_of=2,        # Number of candidates to consider
+                condition_on_previous_text=True,
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,  # Adjust probability threshold
+                no_speech_threshold=0.6
             )
             
-            transcribed_text = result["text"].strip()
+            # Combine all segments into one text
+            transcribed_text = " ".join([segment.text for segment in segments]).strip()
             
             if not transcribed_text:
                 return jsonify({
