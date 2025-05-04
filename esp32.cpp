@@ -24,8 +24,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define BUTTON_PIN 0
 
 // Audio buffer
-#define SAMPLE_RATE    16000
-#define RECORD_SECONDS 2
+#define SAMPLE_RATE    4000
+#define RECORD_SECONDS 8
 #define BUFFER_SIZE    (SAMPLE_RATE * RECORD_SECONDS * 2)
 uint8_t audioBuffer[BUFFER_SIZE];
 

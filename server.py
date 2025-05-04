@@ -88,7 +88,6 @@ def voice_to_text():
             logger.info(f"Transcribed text: {transcribed_text}")
             
             return jsonify({
-                "status": "success",
                 "text": transcribed_text
             })
 
