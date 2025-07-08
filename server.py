@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, PlainTextResponse
 import logging
 import tempfile
 import os
@@ -10,8 +11,8 @@ import wave
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app and Whisper model
-app = Flask(__name__)
+# Initialize FastAPI app and Whisper model
+app = FastAPI()
 # Initialize faster-whisper model with compute type
 model = WhisperModel("medium", device="cpu", compute_type="int8")
 
@@ -21,47 +22,50 @@ def is_valid_audio(file_path):
         try:
             data, samplerate = sf.read(file_path)
             return len(data) > 0 and samplerate > 0
-        except:
+        except Exception:
             # If soundfile fails, try with wave
             try:
                 with wave.open(file_path, 'rb') as wav_file:
                     frames = wav_file.getnframes()
                     rate = wav_file.getframerate()
                     return frames > 0 and rate > 0
-            except:
+            except Exception:
                 logger.error("File is neither valid WAV nor supported by soundfile")
                 return False
     except Exception as e:
         logger.error(f"Audio validation failed: {str(e)}")
         return False
 
-@app.route('/test', methods=['GET'])
-def test_get():
-    return "Server is running!"
+@app.get("/test")
+async def test_get():
+    # Return plain text response to mimic original headers as closely as possible
+    return PlainTextResponse("Server is running!")
 
-@app.route('/voice_to_text', methods=['POST'])
-def voice_to_text():
+@app.post("/voice_to_text")
+async def voice_to_text(request: Request):
     try:
         # Log request details
-        logger.debug(f"Received request: Content-Type: {request.content_type}")
-        logger.debug(f"Request length: {len(request.data)} bytes")
+        content_type = request.headers.get('Content-Type')
+        body = await request.body()
+        logger.debug(f"Received request: Content-Type: {content_type}")
+        logger.debug(f"Request length: {len(body)} bytes")
 
-        if not request.data:
+        if not body:
             logger.warning("Received empty data")
-            return jsonify({"status": "error", "message": "Empty data received"})
+            return JSONResponse(status_code=400, content={"status": "error", "message": "Empty data received"})
 
         # Create a temporary file to store the audio
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
-            temp_file.write(request.data)
+            temp_file.write(body)
             temp_filename = temp_file.name
 
         try:
             # Validate audio file
             if not is_valid_audio(temp_filename):
-                return jsonify({
+                return JSONResponse(status_code=400, content={
                     "status": "error",
                     "message": "Invalid or corrupted audio file"
-                }), 400
+                })
 
             # Transcribe the audio using faster-whisper with adjusted parameters
             segments, info = model.transcribe(
@@ -80,14 +84,14 @@ def voice_to_text():
             transcribed_text = " ".join([segment.text for segment in segments]).strip()
             
             if not transcribed_text:
-                return jsonify({
+                return JSONResponse(status_code=400, content={
                     "status": "error",
                     "message": "No speech detected in audio"
-                }), 400
+                })
             
             logger.info(f"Transcribed text: {transcribed_text}")
             
-            return jsonify({
+            return JSONResponse(content={
                 "text": transcribed_text
             })
 
@@ -97,8 +101,10 @@ def voice_to_text():
 
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}", exc_info=True)
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    import uvicorn
+
     logger.info("Starting server on http://0.0.0.0:5000")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=5000, reload=True)
