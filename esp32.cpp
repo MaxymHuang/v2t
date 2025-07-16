@@ -20,8 +20,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define I2S_SD   33
 #define I2S_SCK  26
 
-// Button
-#define BUTTON_PIN 0
+// Button - Use a different GPIO pin to avoid BOOT pin issues
+#define BUTTON_PIN 2  // Changed from GPIO 0 to GPIO 2
 
 // Audio buffer
 #define SAMPLE_RATE    4000
@@ -29,21 +29,30 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define BUFFER_SIZE    (SAMPLE_RATE * RECORD_SECONDS * 2)
 uint8_t audioBuffer[BUFFER_SIZE];
 
-// Debounce
+// Improved debounce
 bool     lastRawState     = HIGH;
 uint32_t lastDebounceTime = 0;
-const uint32_t debounceDelay = 50;
+const uint32_t debounceDelay = 100;  // Increased to 100ms
+bool     buttonPressed    = false;    // Track button press state
+uint32_t buttonPressTime  = 0;        // Track when button was pressed
 
 // State machine
-enum State { IDLE, RECORDING, SENDING, SHOW_RESULT } ;
-State state = IDLE;
+enum State { IDLE, RECORDING, SENDING, SHOW_RESULT, CHECKING_SERVER };
+State state = CHECKING_SERVER;  // Start by checking server
 uint32_t stateTimestamp = 0;     // for timing SHOW_RESULT
 size_t   bytesRead      = 0;
 String   serverResponse = "";
+bool     serverReady    = false;
+uint32_t lastServerCheck = 0;
+const uint32_t SERVER_CHECK_INTERVAL = 10000;  // Check server every 10 seconds
 
 void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  // Add button debugging
+  Serial.println("Button pin: " + String(BUTTON_PIN));
+  Serial.println("Initial button state: " + String(digitalRead(BUTTON_PIN)));
 
   // OLED init
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while(true);
@@ -62,9 +71,15 @@ void setup() {
     delay(200);
     Serial.print(".");
   }
+  
+  Serial.println();
+  Serial.println("WiFi connected");
+  
+  // Show WiFi connected, then check server
   display.clearDisplay();
   display.setCursor(0,0);
   display.println("WiFi connected");
+  display.println("Checking server...");
   display.display();
 
   // I2S init
@@ -90,6 +105,9 @@ void setup() {
   i2s_driver_install(I2S_NUM_0, &i2s_cfg, 0, nullptr);
   i2s_set_pin(I2S_NUM_0, &pin_cfg);
   i2s_zero_dma_buffer(I2S_NUM_0);
+  
+  // Initial server check
+  checkServer();
 }
 
 // Update the WAV header structure with proper byte ordering
@@ -113,27 +131,98 @@ struct wav_header_t {
 void convert_i2s_to_pcm(const uint8_t* i2s_data, uint8_t* pcm_data, size_t size) {
     for(size_t i = 0; i < size; i += 4) {
         // I2S data is 32-bit, we need 16-bit PCM
-        // Skip first 2 bytes of each I2S word (padding)
-        // and take only the valid 16-bit sample
-        pcm_data[i/2] = i2s_data[i+2];
-        pcm_data[i/2+1] = i2s_data[i+3];
+        // Swap byte order to test for pitch issue
+        pcm_data[i/2] = i2s_data[i+3];
+        pcm_data[i/2+1] = i2s_data[i+2];
     }
 }
 
+bool checkServer() {
+  if (WiFi.status() != WL_CONNECTED) {
+    serverReady = false;
+    return false;
+  }
+  
+  HTTPClient http;
+  String testUrl = String(serverUrl).substring(0, String(serverUrl).lastIndexOf('/')) + "/test";
+  http.begin(testUrl);
+  http.setTimeout(5000);  // 5 second timeout
+  
+  int httpCode = http.GET();
+  String response = "";
+  
+  if (httpCode == 200) {
+    response = http.getString();
+    serverReady = (response == "Server is running!");
+    Serial.println("Server check: " + response);
+  } else {
+    serverReady = false;
+    Serial.println("Server check failed: " + String(httpCode));
+  }
+  
+  http.end();
+  lastServerCheck = millis();
+  return serverReady;
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    display.println("WiFi disconnected");
+    display.println("Check connection");
+  } else if (!serverReady) {
+    display.println("Server not ready");
+    display.println("Check server URL:");
+    display.setCursor(0,24);
+    display.setTextSize(1);
+    // Show just the IP part to fit on screen
+    String url = String(serverUrl);
+    int start = url.indexOf("//") + 2;
+    int end = url.indexOf("/", start);
+    display.println(url.substring(start, end));
+  } else {
+    display.println("READY");
+    display.println("Press button to");
+    display.println("start recording");
+  }
+  
+  display.display();
+}
+
 void loop() {
-  // 1) Read raw button & debounce
+  // Periodic server check (every 10 seconds when idle)
+  if (state == IDLE && millis() - lastServerCheck > SERVER_CHECK_INTERVAL) {
+    state = CHECKING_SERVER;
+  }
+  
+  // Improved button handling with proper debounce and state protection
   bool raw = digitalRead(BUTTON_PIN);
+  
+  // Detect button state change
   if (raw != lastRawState) {
     lastDebounceTime = millis();
   }
+  
+  // Debounce logic
   if (millis() - lastDebounceTime > debounceDelay) {
     static bool lastStable = HIGH;
+    
     if (raw != lastStable) {
       lastStable = raw;
-      if (lastStable == LOW && state == IDLE) {
-        // button pressed → begin recording
+      
+      // Button pressed (LOW = pressed due to INPUT_PULLUP)
+      if (lastStable == LOW && !buttonPressed && state == IDLE && serverReady) {
+        buttonPressed = true;
+        buttonPressTime = millis();
+        Serial.println("Button pressed - starting recording");
         state = RECORDING;
-        Serial.println("→ RECORDING");
+      }
+      // Button released
+      else if (lastStable == HIGH && buttonPressed) {
+        buttonPressed = false;
+        Serial.println("Button released");
       }
     }
   }
@@ -141,7 +230,18 @@ void loop() {
 
   // State machine
   switch(state) {
+    case CHECKING_SERVER:
+      display.clearDisplay();
+      display.setCursor(0,0);
+      display.println("Checking server...");
+      display.display();
+      
+      checkServer();
+      state = IDLE;
+      break;
+      
     case IDLE:
+      updateDisplay();
       break;
 
     case RECORDING:
@@ -153,6 +253,9 @@ void loop() {
       // Perform blocking read (2 seconds)
       i2s_read(I2S_NUM_0, audioBuffer, BUFFER_SIZE, &bytesRead, portMAX_DELAY);
       Serial.printf("Read %u bytes\n", bytesRead);
+      
+      // Reset button state after recording starts
+      buttonPressed = false;
 
       state = SENDING;
       break;
@@ -195,10 +298,13 @@ void loop() {
               serverResponse = http.getString();
           } else {
               serverResponse = "HTTP err:" + String(code);
+              // Mark server as not ready if we get an error
+              serverReady = false;
           }
           http.end();
       } else {
           serverResponse = "WiFi lost";
+          serverReady = false;
       }
       Serial.println("Resp: " + serverResponse);
 
@@ -222,6 +328,13 @@ void loop() {
       break;
   }
 
+  // Safety check: if we're stuck in recording for too long, reset
+  if (state == RECORDING && millis() - buttonPressTime > 10000) {
+    Serial.println("Safety timeout - resetting to IDLE");
+    state = IDLE;
+    buttonPressed = false;
+  }
+  
   // tiny idle delay so we don't starve I2S or WDT
   delay(10);
 }

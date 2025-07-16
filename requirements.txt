@@ -1,5 +1,32 @@
-faster-whisper
-soundfile
+# FastAPI server dependencies
 fastapi
 uvicorn[standard]
+soundfile
+
+# Custom Whisper model dependencies
+torch>=1.12.0
+torchaudio>=0.12.0
+transformers>=4.20.0
+librosa>=0.9.0
+numpy>=1.21.0
+
+# CPU optimization packages (if using CPU)
+# torch>=1.12.0+cpu
+# torchaudio>=0.12.0+cpu
+
+# Intel optimizations (if available)
+mkl
+mkl-service
+
+# Audio processing
+scipy>=1.7.0
+
+# Benchmark dependencies
+psutil
+requests
+statistics
+
+# Optional: GPU support (uncomment if using CUDA)
+# torch>=1.12.0+cu116
+# torchaudio>=0.12.0+cu116
 
