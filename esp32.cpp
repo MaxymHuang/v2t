@@ -28,9 +28,13 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 // Audio configuration for 16kHz streaming
 #define SAMPLE_RATE         16000  // 16kHz for premium quality
 #define CHUNK_DURATION_MS   500    // 500ms chunks for responsive streaming
-#define CHUNK_SIZE          (SAMPLE_RATE * CHUNK_DURATION_MS / 1000 * 2)  // 16KB per chunk
+#define CHUNK_SIZE          (SAMPLE_RATE * CHUNK_DURATION_MS / 1000 * 4)  // 32KB for 32-bit I2S data
 #define DMA_BUFFER_COUNT    8
 #define DMA_BUFFER_LEN      512
+
+// Experimental: Different bit shift amounts to try
+#define BIT_SHIFT_AMOUNT    8   // Try 8 instead of 11 (less aggressive shift)
+// Other values to try: 6, 8, 10, 11, 12, 14, 16
 
 // WebSocket
 WebSocketsClient webSocket;
@@ -61,6 +65,8 @@ String   statusMessage = "";
 uint8_t audioChunk[CHUNK_SIZE];
 bool isStreamingAudio = false;
 uint32_t lastChunkTime = 0;
+uint32_t recordingStartTime = 0;
+int totalChunksSent = 0;
 
 // Connection management
 bool webSocketConnected = false;
@@ -97,16 +103,17 @@ void setup() {
 }
 
 void setupI2S() {
+  // Try a different I2S configuration that might preserve timing better
   i2s_config_t i2s_cfg = {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate          = SAMPLE_RATE,
-    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,  // Changed to 32-bit for proper data handling
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .communication_format = I2S_COMM_FORMAT_STAND_MSB,  // Try MSB format instead
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count        = DMA_BUFFER_COUNT,
     .dma_buf_len          = DMA_BUFFER_LEN,
-    .use_apll             = false,
+    .use_apll             = true,   // Use APLL for more precise timing
     .tx_desc_auto_clear   = false,
     .fixed_mclk           = 0
   };
@@ -131,7 +138,13 @@ void setupI2S() {
   }
   
   i2s_zero_dma_buffer(I2S_NUM_0);
-  Serial.printf("I2S initialized: %dkHz, 32-bit mode for proper data extraction\n", SAMPLE_RATE/1000);
+  
+  // Test actual I2S configuration
+  i2s_get_clk(I2S_NUM_0, &result);  // This might help verify the actual clock
+  
+  Serial.printf("I2S initialized: %dkHz, 32-bit MSB mode with APLL\n", SAMPLE_RATE/1000);
+  Serial.printf("Communication format: MSB (changed from standard I2S)\n");
+  Serial.printf("APLL enabled for precise timing\n");
 }
 
 void startWiFiConnection() {
@@ -242,20 +255,25 @@ void startRecording() {
     return;
   }
   
-  // Send start recording command
+  // Send start recording command with explicit 16kHz rate
   StaticJsonDocument<300> doc;
   doc["command"] = "start_recording";
-  doc["sample_rate"] = SAMPLE_RATE;
-  doc["chunk_size"] = CHUNK_SIZE;
+  doc["sample_rate"] = 16000;  // Explicitly 16kHz for audio integrity
+  doc["chunk_duration_ms"] = CHUNK_DURATION_MS;
+  doc["i2s_config"] = "32bit_to_16bit_conversion";
   
   String jsonString;
   serializeJson(doc, jsonString);
   webSocket.sendTXT(jsonString);
   
+  Serial.printf("Sent start command: 16kHz, %dms chunks, 32->16 bit conversion\n", CHUNK_DURATION_MS);
+  
   isStreamingAudio = true;
   lastChunkTime = millis();
+  recordingStartTime = millis();
+  totalChunksSent = 0;
   
-  Serial.println("Started audio streaming");
+  Serial.println("Started unlimited audio streaming");
 }
 
 void stopRecording() {
@@ -263,51 +281,102 @@ void stopRecording() {
   
   isStreamingAudio = false;
   
+  // Calculate recording statistics with detailed analysis
+  float recordingDuration = (millis() - recordingStartTime) / 1000.0;
+  float expectedDuration = (totalChunksSent * CHUNK_DURATION_MS) / 1000.0;
+  float totalDataMB = (totalChunksSent * CHUNK_SIZE / 2) / (1024.0 * 1024.0); // /2 because we convert 32-bit to 16-bit
+  
+  // Calculate actual vs expected data rates
+  int totalSamples16bit = totalChunksSent * (SAMPLE_RATE * CHUNK_DURATION_MS / 1000);
+  float actualSampleRate = totalSamples16bit / recordingDuration;
+  
   if (webSocketConnected) {
-    StaticJsonDocument<200> doc;
+    StaticJsonDocument<300> doc;
     doc["command"] = "stop_recording";
+    doc["recording_duration"] = recordingDuration;
+    doc["total_chunks"] = totalChunksSent;
+    doc["expected_sample_rate"] = SAMPLE_RATE;
+    doc["calculated_sample_rate"] = actualSampleRate;
     
     String jsonString;
     serializeJson(doc, jsonString);
     webSocket.sendTXT(jsonString);
   }
   
-  Serial.println("Stopped audio streaming");
+  Serial.println("=== RECORDING ANALYSIS ===");
+  Serial.printf("Duration: %.2fs (expected: %.2fs)\n", recordingDuration, expectedDuration);
+  Serial.printf("Chunks: %d, Data: %.2fMB\n", totalChunksSent, totalDataMB);
+  Serial.printf("Expected sample rate: %dHz\n", SAMPLE_RATE);
+  Serial.printf("Calculated sample rate: %.0fHz\n", actualSampleRate);
+  Serial.printf("Sample rate ratio: %.3f (1.000 = perfect)\n", actualSampleRate / SAMPLE_RATE);
+  
+  if (abs(actualSampleRate - SAMPLE_RATE) > 100) {
+    Serial.println("WARNING: Sample rate mismatch detected!");
+    Serial.println("This will cause speed/pitch issues in transcription");
+  }
 }
 
 void streamAudioChunk() {
   if (!isStreamingAudio || !webSocketConnected) return;
   
-  // Check if it's time for next chunk
-  if (millis() - lastChunkTime < CHUNK_DURATION_MS) return;
+  // Precise timing - wait for exact chunk duration
+  uint32_t now = millis();
+  if (now - lastChunkTime < CHUNK_DURATION_MS) return;
   
   size_t bytesRead;
-  esp_err_t result = i2s_read(I2S_NUM_0, audioChunk, CHUNK_SIZE, &bytesRead, 0);
+  esp_err_t result = i2s_read(I2S_NUM_0, audioChunk, CHUNK_SIZE, &bytesRead, portMAX_DELAY);
   
   if (result == ESP_OK && bytesRead > 0) {
-    // Proper I2S 32-bit to 16-bit PCM conversion
+    // Verify we got the expected amount of data
+    int expectedSamples = (SAMPLE_RATE * CHUNK_DURATION_MS) / 1000;  // Expected 16-bit samples
     int32_t* samples = (int32_t*) audioChunk;
-    int samplesToSend = bytesRead / 4;  // 4 bytes per 32-bit sample
+    int samplesToSend = bytesRead / 4;  // 4 bytes per 32-bit I2S sample
     
-    // Allocate 16-bit PCM buffer
+    // Validate timing integrity
+    if (samplesToSend != expectedSamples) {
+      Serial.printf("WARNING: Sample count mismatch! Expected %d, got %d\n", expectedSamples, samplesToSend);
+    }
+    
+    // Allocate 16-bit PCM buffer with exact sample count
     size_t pcmSize = samplesToSend * 2;  // 2 bytes per 16-bit sample
     int16_t* pcmData = new int16_t[samplesToSend];
     
-    // Convert 32-bit I2S samples to 16-bit PCM with proper scaling
+    // Convert 32-bit I2S samples to 16-bit PCM preserving timing
+    // Using configurable bit shift to find the right conversion
     for (int i = 0; i < samplesToSend; i++) {
-      // Shift right to convert 32-bit to 16-bit range
-      // >> 11 provides good volume scaling, can be adjusted (8-16 range)
-      pcmData[i] = (int16_t)(samples[i] >> 11);
-  }
-  
-    // Send binary data via WebSocket
+      // Try different bit shifts - this is the most critical part!
+      pcmData[i] = (int16_t)(samples[i] >> BIT_SHIFT_AMOUNT);
+    }
+    
+    // Debug: Log sample values and configuration periodically
+    if (totalChunksSent % 20 == 0 && samplesToSend > 0) {
+      Serial.printf("Sample debug (shift=%d): Raw I2S: %d (0x%X), Converted: %d\n", 
+                    BIT_SHIFT_AMOUNT, samples[0], samples[0], pcmData[0]);
+      Serial.printf("Config: %dkHz, MSB format, APLL enabled\n", SAMPLE_RATE);
+    }
+    
+    // Send binary data via WebSocket (maintain chunk order)
     webSocket.sendBIN((uint8_t*)pcmData, pcmSize);
     
     delete[] pcmData;
-    lastChunkTime = millis();
+    lastChunkTime = now;  // Use captured time for precise timing
+    totalChunksSent++;
     
-    Serial.printf("Sent audio chunk: %d samples (%u bytes) from %u I2S bytes\n", 
-                  samplesToSend, pcmSize, bytesRead);
+    // Timing validation log every 10 chunks
+    if (totalChunksSent % 10 == 0) {
+      float actualDuration = (now - recordingStartTime) / 1000.0;
+      float expectedDuration = (totalChunksSent * CHUNK_DURATION_MS) / 1000.0;
+      float timingError = actualDuration - expectedDuration;
+      
+      Serial.printf("Timing check: %.1fs actual, %.1fs expected, error: %.3fs\n", 
+                    actualDuration, expectedDuration, timingError);
+      
+      if (abs(timingError) > 0.1) {  // More than 100ms drift
+        Serial.printf("WARNING: Timing drift detected! This may cause speed issues.\n");
+      }
+    }
+  } else {
+    Serial.printf("I2S read error: %d, bytes: %u\n", result, bytesRead);
   }
 }
 
@@ -375,11 +444,15 @@ void updateDisplay() {
       break;
 
     case RECORDING:
-      display.println("STREAMING...");
-      display.println("Release to stop");
-      display.println("");
-      display.printf("Rate: %dkHz\n", SAMPLE_RATE/1000);
-      display.printf("Chunk: %dms\n", CHUNK_DURATION_MS);
+      {
+        float duration = (millis() - recordingStartTime) / 1000.0;
+        display.println("STREAMING...");
+        display.println("Release to stop");
+        display.println("");
+        display.printf("Time: %.1fs\n", duration);
+        display.printf("Chunks: %d\n", totalChunksSent);
+        display.printf("Rate: %dkHz\n", SAMPLE_RATE/1000);
+      }
       break;
       
     case SHOW_RESULT:

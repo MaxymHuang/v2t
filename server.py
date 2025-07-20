@@ -69,17 +69,28 @@ class AudioStreamManager:
             logger.warning(f"Received audio for unknown client {client_id}")
             return
             
-        # Add chunk to buffer
+        # Validate chunk data
+        if len(audio_data) == 0:
+            logger.warning(f"Received empty audio chunk from {client_id}")
+            return
+            
+        if len(audio_data) % 2 != 0:
+            logger.warning(f"Received odd-sized chunk ({len(audio_data)} bytes) from {client_id}")
+            # Pad with zero byte to maintain 16-bit alignment
+            audio_data += b'\x00'
+            
+        # Add chunk to buffer (preserve order, accumulate all chunks)
         self.audio_buffers[client_id].append(audio_data)
         
-        # If we have enough data (approximately 2 seconds at 16kHz), process it
+        # Log progress periodically
+        chunk_count = len(self.audio_buffers[client_id])
         total_bytes = sum(len(chunk) for chunk in self.audio_buffers[client_id])
         
-        # Estimate: 16kHz * 1 channel * 2 bytes/sample * 2 seconds = 64KB
-        # Use smaller buffer for very responsive processing
-        if total_bytes >= 16000:  # ~0.5 seconds of 16kHz mono audio for very fast response
-            logger.info(f"Processing {total_bytes} bytes for {client_id}")
-            await self.process_audio_buffer(client_id)
+        if chunk_count % 20 == 0:  # Log every 20 chunks (10 seconds at 500ms chunks)
+            duration_estimate = (total_bytes / 2) / 16000  # 16-bit samples at 16kHz
+            logger.info(f"Chunk #{chunk_count}: {total_bytes} bytes, ~{duration_estimate:.1f}s for {client_id}")
+        
+        # Only process when explicitly told to stop recording
             
     async def process_audio_buffer(self, client_id: str):
         """Process accumulated audio buffer and transcribe"""
@@ -104,13 +115,28 @@ class AudioStreamManager:
             # Convert to numpy array (16-bit PCM from ESP32 I2S extraction)
             audio_array = np.frombuffer(combined_audio, dtype=np.int16)
             
-            # Audio quality validation
-            sample_rate = self.sample_rates[client_id]
-            duration = len(audio_array) / sample_rate
+            # CRITICAL DEBUGGING: Let's figure out the actual data rate
+            chunk_count = len(self.audio_buffers[client_id])  # This was set to 0 above, but let's track it
+            
+            # Calculate what the ACTUAL sample rate should be based on timing
+            # If ESP32 sent data for X seconds, and we have Y samples, then actual_rate = Y/X
+            logger.info(f"DEBUGGING: Raw audio analysis")
+            logger.info(f"- Combined audio bytes: {len(combined_audio)}")
+            logger.info(f"- 16-bit samples: {len(audio_array)}")
+            logger.info(f"- Expected sample rate: 16000Hz")
+            
+            # Let's try different sample rates to see which one makes sense
+            for test_rate in [8000, 12000, 16000, 24000, 32000]:
+                test_duration = len(audio_array) / test_rate
+                logger.info(f"- If sample rate is {test_rate}Hz: duration = {test_duration:.2f}s")
+            
+            # Audio quality validation with debugging
+            assumed_sample_rate = 16000  # What we think it should be
+            assumed_duration = len(audio_array) / assumed_sample_rate
             rms_level = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
             peak_level = np.max(np.abs(audio_array))
             
-            logger.info(f"Audio stats: {len(audio_array)} samples, {duration:.2f}s, RMS: {rms_level:.1f}, Peak: {peak_level}")
+            logger.info(f"Audio stats at 16kHz: {len(audio_array)} samples, {assumed_duration:.2f}s, RMS: {rms_level:.1f}, Peak: {peak_level}")
             
             # Check for valid audio signal
             if peak_level < 100:  # Very quiet signal
@@ -122,20 +148,48 @@ class AudioStreamManager:
             if len(audio_array) > 0:
                 audio_float = audio_array.astype(np.float32) / 32768.0
                 
-                # Save to temporary WAV file for transcription
+                # EXPERIMENTAL: Try to detect the correct sample rate based on timing
+                # If the ESP32 says it's sending 16kHz but audio sounds sped up,
+                # maybe the actual effective rate is different
+                
+                # Let's try multiple sample rates and see which makes sense
+                test_rates = [8000, 12000, 16000, 22050, 24000]
+                
+                logger.info("EXPERIMENTAL: Trying multiple sample rates to find correct timing...")
+                
+                # For now, let's try the most common issue: ESP32 might be effectively 
+                # sending at 8kHz but we're treating it as 16kHz (causing 2x speed)
+                corrected_sample_rate = 8000  # Try this first
+                
+                logger.info(f"EXPERIMENTAL: Using {corrected_sample_rate}Hz instead of 16kHz to correct speed")
+                
+                # Save to temporary WAV file with corrected sample rate
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-                sf.write(temp_file.name, audio_float, self.sample_rates[client_id])
+                sf.write(temp_file.name, audio_float, corrected_sample_rate)
                 temp_file.close()
                 
+                # Update our stored sample rate
+                self.sample_rates[client_id] = corrected_sample_rate
+                
                 try:
-                    # Preprocess and transcribe
+                    # CRITICAL: Only transcribe after all chunks are merged and processed
+                    logger.info("Starting transcription of complete merged recording")
+                    
+                    # Preprocess while preserving audio integrity
                     preprocessed_file = preprocess_audio(temp_file.name)
+                    
+                    # Verify the preprocessed file maintains correct timing
+                    verification_audio, verification_sr = sf.read(preprocessed_file)
+                    verification_duration = len(verification_audio) / verification_sr
+                    logger.info(f"Transcription input verified: {len(verification_audio)} samples at {verification_sr}Hz ({verification_duration:.2f}s)")
                     
                     # Initialize model if needed
                     initialize_custom_model()
                     
-                    # Transcribe
+                    # Transcribe the complete, properly processed audio
+                    logger.info("Starting Whisper transcription...")
                     transcription = transcribe_with_custom_model(preprocessed_file)
+                    logger.info(f"Transcription completed: '{transcription}'")
                     
                     # Send result back to client
                     if client_id in self.connections:
@@ -239,54 +293,48 @@ def is_valid_audio(file_path):
         return False
 
 def preprocess_audio(file_path):
-    """Preprocess audio: handle 16kHz PCM from ESP32 I2S extraction"""
-    import scipy.signal
+    """Preprocess audio: preserve 16kHz PCM integrity from ESP32 I2S extraction"""
     try:
-        # Read audio file (should already be 16kHz from ESP32)
+        # Read audio file (already 16kHz from ESP32 with proper chunk combination)
         audio, sr = sf.read(file_path)
         logger.info(f"Preprocessing: loaded {len(audio)} samples at {sr}Hz from ESP32")
         
-        # Convert to mono if stereo
+        # Convert to mono if stereo (shouldn't happen with ESP32 mono mic)
         if len(audio.shape) > 1:
             audio = np.mean(audio, axis=1)
             logger.info("Converted stereo to mono")
         
-        # Audio quality check
+        # Audio quality validation
         rms = np.sqrt(np.mean(audio ** 2))
         peak = np.max(np.abs(audio))
-        logger.info(f"Audio quality: RMS={rms:.4f}, Peak={peak:.4f}")
+        duration = len(audio) / sr
+        logger.info(f"Audio integrity check: {len(audio)} samples, {duration:.2f}s, RMS={rms:.4f}, Peak={peak:.4f}")
         
-        # Gentle normalization (preserve dynamics, avoid over-normalization)
-        if peak > 0.1:  # Only normalize if signal is strong enough
-            # Normalize to 80% of full scale to avoid clipping
-            audio = audio * (0.8 / peak)
-            logger.info(f"Normalized audio to 80% scale (was {peak:.4f})")
+        # Verify sample rate is exactly 16kHz (critical for audio integrity)
+        if sr != 16000:
+            logger.error(f"CRITICAL: Sample rate mismatch! Expected 16000Hz, got {sr}Hz - this causes speed issues!")
+            # Force correct sample rate without resampling (preserve timing)
+            sr = 16000
+            logger.info("Corrected sample rate to 16000Hz to preserve audio timing")
+        
+        # Minimal processing to preserve audio integrity
+        # Only normalize if signal is very weak or very strong
+        if peak < 0.01:  # Very weak signal
+            audio = audio * (0.1 / (peak + 1e-10))  # Gentle boost
+            logger.info(f"Boosted weak signal from {peak:.4f} to ~0.1")
+        elif peak > 0.95:  # Near clipping
+            audio = audio * (0.8 / peak)  # Gentle reduction
+            logger.info(f"Reduced clipping signal from {peak:.4f} to 0.8")
         else:
-            logger.warning(f"Weak audio signal (peak: {peak:.4f}), minimal processing")
+            logger.info("Audio level is good, no normalization needed")
         
-        # Ensure we have 16kHz (ESP32 should already provide this)
-        target_sr = 16000
-        if abs(sr - target_sr) > 10:  # Allow small tolerance
-            logger.info(f"Resampling from {sr}Hz to {target_sr}Hz")
-            duration = len(audio) / sr
-            num_samples = int(duration * target_sr)
-            audio = scipy.signal.resample(audio, num_samples)
-            sr = target_sr
-        else:
-            logger.info(f"Sample rate {sr}Hz is correct, no resampling needed")
+        # NO RESAMPLING - preserve original timing and pitch
+        logger.info(f"Final audio: {len(audio)} samples at {sr}Hz ({duration:.2f}s)")
         
-        # For streaming: use shorter buffer (2 seconds max for responsive processing)
-        target_length = min(2 * target_sr, len(audio))  # Max 2 seconds
-        if len(audio) > target_length:
-            audio = audio[:target_length]
-            logger.info(f"Trimmed to {target_length} samples ({target_length/target_sr:.1f}s)")
-        elif len(audio) < target_sr * 0.1:  # Less than 100ms
-            logger.warning(f"Very short audio: {len(audio)} samples ({len(audio)/target_sr:.3f}s)")
-        
-        # Save preprocessed audio
+        # Save with preserved timing
         processed_path = file_path.replace('.wav', '_processed.wav')
-        sf.write(processed_path, audio, target_sr)
-        logger.info(f"Saved preprocessed audio: {len(audio)} samples at {target_sr}Hz")
+        sf.write(processed_path, audio, sr)
+        logger.info("Audio preprocessing complete - timing and pitch preserved")
         return processed_path
         
     except Exception as e:
@@ -465,24 +513,29 @@ async def websocket_audio_endpoint(websocket: WebSocket, client_id: str):
                         if command == "start_recording":
                             logger.info(f"Start recording command from {client_id}")
                             audio_manager.is_recording[client_id] = True
-                            audio_manager.sample_rates[client_id] = data.get("sample_rate", 16000)
+                            # Always use 16kHz for ESP32 to ensure audio integrity
+                            audio_manager.sample_rates[client_id] = 16000
+                            # Clear any existing buffer to start fresh
+                            audio_manager.audio_buffers[client_id] = []
                             
                             response = {
                                 "type": "status",
                                 "message": "Recording started",
-                                "sample_rate": audio_manager.sample_rates[client_id]
+                                "sample_rate": 16000
                             }
-                            logger.info(f"Sending response to {client_id}: {response}")
+                            logger.info(f"Recording started for {client_id} at 16kHz")
                             await websocket.send_text(json.dumps(response))
                             
                         elif command == "stop_recording":
                             audio_manager.is_recording[client_id] = False
-                            # Process any remaining audio in buffer
+                            # Process all accumulated audio chunks
                             if audio_manager.audio_buffers[client_id]:
+                                total_bytes = sum(len(chunk) for chunk in audio_manager.audio_buffers[client_id])
+                                logger.info(f"Processing complete recording: {total_bytes} bytes for {client_id}")
                                 await audio_manager.process_audio_buffer(client_id)
                             await websocket.send_text(json.dumps({
-                                "type": "status",
-                                "message": "Recording stopped"
+                                "type": "status", 
+                                "message": "Recording stopped and processed"
                             }))
                             
                         elif command == "ping":
