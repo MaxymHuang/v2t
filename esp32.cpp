@@ -33,7 +33,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define DMA_BUFFER_LEN      512
 
 // Experimental: Different bit shift amounts to try
-#define BIT_SHIFT_AMOUNT    8   // Try 8 instead of 11 (less aggressive shift)
+#define BIT_SHIFT_AMOUNT    11   // Try 8 instead of 11 (less aggressive shift)
 // Other values to try: 6, 8, 10, 11, 12, 14, 16
 
 // WebSocket
