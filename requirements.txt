@@ -2,6 +2,8 @@
 fastapi
 uvicorn[standard]
 soundfile
+websockets
+python-socketio
 
 # Custom Whisper model dependencies
 torch>=1.12.0

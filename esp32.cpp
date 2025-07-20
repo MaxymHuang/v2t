@@ -1,5 +1,6 @@
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -8,7 +9,8 @@
 // Wi-Fi
 const char* ssid      = "WIFI_SSID";
 const char* password  = "WIFI_PASSWORD";
-const char* serverUrl = "http://SERVER_IP:PORT/voice_to_text";
+const char* serverIP  = "SERVER_IP";  // e.g., "192.168.1.100"
+const int   serverPort = 5000;
 
 // OLED
 #define SCREEN_WIDTH 128
@@ -23,318 +25,469 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 // Button - Use a different GPIO pin to avoid BOOT pin issues
 #define BUTTON_PIN 2  // Changed from GPIO 0 to GPIO 2
 
-// Audio buffer
-#define SAMPLE_RATE    4000
-#define RECORD_SECONDS 8
-#define BUFFER_SIZE    (SAMPLE_RATE * RECORD_SECONDS * 2)
-uint8_t audioBuffer[BUFFER_SIZE];
+// Audio configuration for 16kHz streaming
+#define SAMPLE_RATE         16000  // 16kHz for premium quality
+#define CHUNK_DURATION_MS   500    // 500ms chunks for responsive streaming
+#define CHUNK_SIZE          (SAMPLE_RATE * CHUNK_DURATION_MS / 1000 * 2)  // 16KB per chunk
+#define DMA_BUFFER_COUNT    8
+#define DMA_BUFFER_LEN      512
 
-// Improved debounce
+// WebSocket
+WebSocketsClient webSocket;
+String clientId = "esp32_device";
+
+// Button handling
 bool     lastRawState     = HIGH;
 uint32_t lastDebounceTime = 0;
-const uint32_t debounceDelay = 100;  // Increased to 100ms
-bool     buttonPressed    = false;    // Track button press state
-uint32_t buttonPressTime  = 0;        // Track when button was pressed
+const uint32_t debounceDelay = 50;
+bool     buttonPressed    = false;
+bool     wasPressed       = false;
 
 // State machine
-enum State { IDLE, RECORDING, SENDING, SHOW_RESULT, CHECKING_SERVER };
-State state = CHECKING_SERVER;  // Start by checking server
-uint32_t stateTimestamp = 0;     // for timing SHOW_RESULT
-size_t   bytesRead      = 0;
-String   serverResponse = "";
-bool     serverReady    = false;
-uint32_t lastServerCheck = 0;
-const uint32_t SERVER_CHECK_INTERVAL = 10000;  // Check server every 10 seconds
+enum State { 
+  CONNECTING_WIFI, 
+  CONNECTING_WEBSOCKET, 
+  IDLE, 
+  RECORDING, 
+  SHOW_RESULT,
+  ERROR_STATE 
+};
+State state = CONNECTING_WIFI;
+uint32_t stateTimestamp = 0;
+String   lastTranscription = "";
+String   statusMessage = "";
+
+// Audio streaming
+uint8_t audioChunk[CHUNK_SIZE];
+bool isStreamingAudio = false;
+uint32_t lastChunkTime = 0;
+
+// Connection management
+bool webSocketConnected = false;
+uint32_t lastReconnectAttempt = 0;
+const uint32_t RECONNECT_INTERVAL = 5000;
 
 void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   
-  // Add button debugging
-  Serial.println("Button pin: " + String(BUTTON_PIN));
-  Serial.println("Initial button state: " + String(digitalRead(BUTTON_PIN)));
+  Serial.println("=== ESP32 WebSocket Voice Recorder ===");
+  Serial.println("Sample Rate: 16kHz");
+  Serial.println("Chunk Size: 500ms");
 
   // OLED init
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while(true);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED initialization failed!");
+    while(true);
+  }
+  
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-
-  // Show startup
   display.setCursor(0,0);
   display.println("Starting...");
+  display.println("Sample Rate: 16kHz");
   display.display();
 
-  // Wi-Fi
-  WiFi.begin(ssid, password);
-  while(WiFi.status() != WL_CONNECTED) {
-    delay(200);
-    Serial.print(".");
-  }
+  // Initialize I2S for 16kHz streaming
+  setupI2S();
   
-  Serial.println();
-  Serial.println("WiFi connected");
-  
-  // Show WiFi connected, then check server
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("WiFi connected");
-  display.println("Checking server...");
-  display.display();
+  // Start WiFi connection
+  startWiFiConnection();
+}
 
-  // I2S init
+void setupI2S() {
   i2s_config_t i2s_cfg = {
-    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER|I2S_MODE_RX),
+    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate          = SAMPLE_RATE,
-    .bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,  // Changed to 32-bit for proper data handling
     .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count        = 8,
-    .dma_buf_len          = 1024,
+    .dma_buf_count        = DMA_BUFFER_COUNT,
+    .dma_buf_len          = DMA_BUFFER_LEN,
     .use_apll             = false,
     .tx_desc_auto_clear   = false,
     .fixed_mclk           = 0
   };
+  
   i2s_pin_config_t pin_cfg = {
     .bck_io_num   = I2S_SCK,
     .ws_io_num    = I2S_WS,
     .data_out_num = -1,
     .data_in_num  = I2S_SD
   };
-  i2s_driver_install(I2S_NUM_0, &i2s_cfg, 0, nullptr);
-  i2s_set_pin(I2S_NUM_0, &pin_cfg);
+  
+  esp_err_t result = i2s_driver_install(I2S_NUM_0, &i2s_cfg, 0, nullptr);
+  if (result != ESP_OK) {
+    Serial.printf("I2S driver install failed: %d\n", result);
+    return;
+  }
+  
+  result = i2s_set_pin(I2S_NUM_0, &pin_cfg);
+  if (result != ESP_OK) {
+    Serial.printf("I2S pin config failed: %d\n", result);
+    return;
+  }
+  
   i2s_zero_dma_buffer(I2S_NUM_0);
-  
-  // Initial server check
-  checkServer();
+  Serial.printf("I2S initialized: %dkHz, 32-bit mode for proper data extraction\n", SAMPLE_RATE/1000);
 }
 
-// Update the WAV header structure with proper byte ordering
-struct wav_header_t {
-    char riff[4] = {'R', 'I', 'F', 'F'};
-    uint32_t chunk_size;  // Total file size - 8
-    char wave[4] = {'W', 'A', 'V', 'E'};
-    char fmt[4] = {'f', 'm', 't', ' '};
-    uint32_t fmt_chunk_size = 16;
-    uint16_t audio_format = 1;  // PCM
-    uint16_t num_channels = 1;  // Mono
-    uint32_t sample_rate = SAMPLE_RATE;
-    uint32_t byte_rate = SAMPLE_RATE * 2;  // SampleRate * NumChannels * BitsPerSample/8
-    uint16_t block_align = 2;  // NumChannels * BitsPerSample/8
-    uint16_t bits_per_sample = 16;
-    char data[4] = {'d', 'a', 't', 'a'};
-    uint32_t data_chunk_size;  // NumSamples * NumChannels * BitsPerSample/8
-};
+void startWiFiConnection() {
+  Serial.printf("Connecting to WiFi: %s\n", ssid);
+  WiFi.begin(ssid, password);
+  state = CONNECTING_WIFI;
+  stateTimestamp = millis();
+}
 
-// Add this function to convert I2S data to proper PCM format
-void convert_i2s_to_pcm(const uint8_t* i2s_data, uint8_t* pcm_data, size_t size) {
-    for(size_t i = 0; i < size; i += 4) {
-        // I2S data is 32-bit, we need 16-bit PCM
-        // Swap byte order to test for pitch issue
-        pcm_data[i/2] = i2s_data[i+3];
-        pcm_data[i/2+1] = i2s_data[i+2];
+void setupWebSocket() {
+  String wsPath = "/ws/audio/" + clientId;
+  webSocket.begin(serverIP, serverPort, wsPath);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(RECONNECT_INTERVAL);
+  webSocket.enableHeartbeat(15000, 3000, 2);
+  
+  Serial.printf("WebSocket connecting to: ws://%s:%d%s\n", serverIP, serverPort, wsPath.c_str());
+}
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("WebSocket Disconnected");
+      webSocketConnected = false;
+      if (state == RECORDING) {
+        stopRecording();
+      }
+      break;
+      
+    case WStype_CONNECTED:
+      Serial.printf("WebSocket Connected to: %s\n", payload);
+      webSocketConnected = true;
+      sendPing();
+      break;
+      
+    case WStype_TEXT:
+      handleWebSocketMessage((char*)payload);
+      break;
+      
+    case WStype_BIN:
+      Serial.printf("Received binary data: %u bytes\n", length);
+      break;
+      
+    case WStype_ERROR:
+      Serial.printf("WebSocket Error: %s\n", payload);
+      webSocketConnected = false;
+      break;
+      
+    case WStype_FRAGMENT_TEXT_START:
+    case WStype_FRAGMENT_BIN_START:
+    case WStype_FRAGMENT:
+    case WStype_FRAGMENT_FIN:
+      break;
+  }
+}
+
+void handleWebSocketMessage(const char* message) {
+  Serial.printf("WebSocket message: %s\n", message);
+  
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, message);
+  
+  if (error) {
+    Serial.printf("JSON parse error: %s\n", error.c_str());
+    return;
+  }
+  
+  String type = doc["type"];
+  
+  if (type == "transcription") {
+    String text = doc["text"];
+    lastTranscription = text;
+    Serial.printf("Transcription received: %s\n", text.c_str());
+    
+    // Show result
+    state = SHOW_RESULT;
+    stateTimestamp = millis();
+    
+  } else if (type == "status") {
+    String message = doc["message"];
+    statusMessage = message;
+    Serial.printf("Status: %s\n", message.c_str());
+    
+  } else if (type == "error") {
+    String errorMsg = doc["message"];
+    Serial.printf("Server error: %s\n", errorMsg.c_str());
+    statusMessage = "Error: " + errorMsg;
+    
+  } else if (type == "pong") {
+    Serial.println("Ping response received");
+  }
+}
+
+void sendPing() {
+  if (!webSocketConnected) return;
+  
+  StaticJsonDocument<200> doc;
+  doc["command"] = "ping";
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  webSocket.sendTXT(jsonString);
+}
+
+void startRecording() {
+  if (!webSocketConnected) {
+    Serial.println("Cannot start recording - WebSocket not connected");
+    return;
+  }
+  
+  // Send start recording command
+  StaticJsonDocument<300> doc;
+  doc["command"] = "start_recording";
+  doc["sample_rate"] = SAMPLE_RATE;
+  doc["chunk_size"] = CHUNK_SIZE;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  webSocket.sendTXT(jsonString);
+  
+  isStreamingAudio = true;
+  lastChunkTime = millis();
+  
+  Serial.println("Started audio streaming");
+}
+
+void stopRecording() {
+  if (!isStreamingAudio) return;
+  
+  isStreamingAudio = false;
+  
+  if (webSocketConnected) {
+    StaticJsonDocument<200> doc;
+    doc["command"] = "stop_recording";
+    
+    String jsonString;
+    serializeJson(doc, jsonString);
+    webSocket.sendTXT(jsonString);
+  }
+  
+  Serial.println("Stopped audio streaming");
+}
+
+void streamAudioChunk() {
+  if (!isStreamingAudio || !webSocketConnected) return;
+  
+  // Check if it's time for next chunk
+  if (millis() - lastChunkTime < CHUNK_DURATION_MS) return;
+  
+  size_t bytesRead;
+  esp_err_t result = i2s_read(I2S_NUM_0, audioChunk, CHUNK_SIZE, &bytesRead, 0);
+  
+  if (result == ESP_OK && bytesRead > 0) {
+    // Proper I2S 32-bit to 16-bit PCM conversion
+    int32_t* samples = (int32_t*) audioChunk;
+    int samplesToSend = bytesRead / 4;  // 4 bytes per 32-bit sample
+    
+    // Allocate 16-bit PCM buffer
+    size_t pcmSize = samplesToSend * 2;  // 2 bytes per 16-bit sample
+    int16_t* pcmData = new int16_t[samplesToSend];
+    
+    // Convert 32-bit I2S samples to 16-bit PCM with proper scaling
+    for (int i = 0; i < samplesToSend; i++) {
+      // Shift right to convert 32-bit to 16-bit range
+      // >> 11 provides good volume scaling, can be adjusted (8-16 range)
+      pcmData[i] = (int16_t)(samples[i] >> 11);
+  }
+  
+    // Send binary data via WebSocket
+    webSocket.sendBIN((uint8_t*)pcmData, pcmSize);
+    
+    delete[] pcmData;
+    lastChunkTime = millis();
+    
+    Serial.printf("Sent audio chunk: %d samples (%u bytes) from %u I2S bytes\n", 
+                  samplesToSend, pcmSize, bytesRead);
+  }
+}
+
+void handleButton() {
+  bool raw = digitalRead(BUTTON_PIN);
+  
+  if (raw != lastRawState) {
+    lastDebounceTime = millis();
+  }
+  
+  if (millis() - lastDebounceTime > debounceDelay) {
+    if (raw != buttonPressed) {
+      buttonPressed = raw;
+      
+      // Button pressed (LOW due to INPUT_PULLUP)
+      if (!buttonPressed && !wasPressed && state == IDLE && webSocketConnected) {
+        wasPressed = true;
+        startRecording();
+        state = RECORDING;
+        Serial.println("Button pressed - starting recording");
+      }
+      // Button released
+      else if (buttonPressed && wasPressed) {
+        wasPressed = false;
+        if (state == RECORDING) {
+          stopRecording();
+          state = IDLE;
+          Serial.println("Button released - stopping recording");
+      }
     }
-}
-
-bool checkServer() {
-  if (WiFi.status() != WL_CONNECTED) {
-    serverReady = false;
-    return false;
+  }
   }
   
-  HTTPClient http;
-  String testUrl = String(serverUrl).substring(0, String(serverUrl).lastIndexOf('/')) + "/test";
-  http.begin(testUrl);
-  http.setTimeout(5000);  // 5 second timeout
-  
-  int httpCode = http.GET();
-  String response = "";
-  
-  if (httpCode == 200) {
-    response = http.getString();
-    serverReady = (response == "Server is running!");
-    Serial.println("Server check: " + response);
-  } else {
-    serverReady = false;
-    Serial.println("Server check failed: " + String(httpCode));
-  }
-  
-  http.end();
-  lastServerCheck = millis();
-  return serverReady;
+  lastRawState = raw;
 }
 
 void updateDisplay() {
   display.clearDisplay();
   display.setCursor(0,0);
+  display.setTextSize(1);
   
-  if (WiFi.status() != WL_CONNECTED) {
-    display.println("WiFi disconnected");
-    display.println("Check connection");
-  } else if (!serverReady) {
-    display.println("Server not ready");
-    display.println("Check server URL:");
-    display.setCursor(0,24);
-    display.setTextSize(1);
-    // Show just the IP part to fit on screen
-    String url = String(serverUrl);
-    int start = url.indexOf("//") + 2;
-    int end = url.indexOf("/", start);
-    display.println(url.substring(start, end));
-  } else {
-    display.println("READY");
-    display.println("Press button to");
-    display.println("start recording");
-  }
-  
-  display.display();
-}
-
-void loop() {
-  // Periodic server check (every 10 seconds when idle)
-  if (state == IDLE && millis() - lastServerCheck > SERVER_CHECK_INTERVAL) {
-    state = CHECKING_SERVER;
-  }
-  
-  // Improved button handling with proper debounce and state protection
-  bool raw = digitalRead(BUTTON_PIN);
-  
-  // Detect button state change
-  if (raw != lastRawState) {
-    lastDebounceTime = millis();
-  }
-  
-  // Debounce logic
-  if (millis() - lastDebounceTime > debounceDelay) {
-    static bool lastStable = HIGH;
-    
-    if (raw != lastStable) {
-      lastStable = raw;
-      
-      // Button pressed (LOW = pressed due to INPUT_PULLUP)
-      if (lastStable == LOW && !buttonPressed && state == IDLE && serverReady) {
-        buttonPressed = true;
-        buttonPressTime = millis();
-        Serial.println("Button pressed - starting recording");
-        state = RECORDING;
-      }
-      // Button released
-      else if (lastStable == HIGH && buttonPressed) {
-        buttonPressed = false;
-        Serial.println("Button released");
-      }
-    }
-  }
-  lastRawState = raw;
-
-  // State machine
   switch(state) {
-    case CHECKING_SERVER:
-      display.clearDisplay();
-      display.setCursor(0,0);
-      display.println("Checking server...");
-      display.display();
+    case CONNECTING_WIFI:
+      display.println("Connecting WiFi...");
+      display.println(ssid);
+      break;
       
-      checkServer();
-      state = IDLE;
+    case CONNECTING_WEBSOCKET:
+      display.println("WiFi Connected");
+      display.println("Connecting to server...");
+      display.printf("IP: %s:%d\n", serverIP, serverPort);
       break;
       
     case IDLE:
-      updateDisplay();
+      if (webSocketConnected) {
+        display.println("READY - 16kHz");
+        display.println("Hold button to");
+        display.println("start streaming");
+        display.println("");
+        display.println("WebSocket: Connected");
+      } else {
+        display.println("WebSocket Error");
+        display.println("Reconnecting...");
+      }
       break;
 
     case RECORDING:
-      display.clearDisplay();
-      display.setCursor(0,0);
-      display.println("Recording...");
-      display.display();
-
-      // Perform blocking read (2 seconds)
-      i2s_read(I2S_NUM_0, audioBuffer, BUFFER_SIZE, &bytesRead, portMAX_DELAY);
-      Serial.printf("Read %u bytes\n", bytesRead);
+      display.println("STREAMING...");
+      display.println("Release to stop");
+      display.println("");
+      display.printf("Rate: %dkHz\n", SAMPLE_RATE/1000);
+      display.printf("Chunk: %dms\n", CHUNK_DURATION_MS);
+      break;
       
-      // Reset button state after recording starts
-      buttonPressed = false;
+    case SHOW_RESULT:
+      display.println("Result:");
+      display.println("--------");
 
-      state = SENDING;
-      break;
-
-    case SENDING: {
-      display.clearDisplay();
-      display.setCursor(0,0);
-      display.println("Sending...");
-      display.display();
-
-      if (WiFi.status() == WL_CONNECTED) {
-          // Convert I2S data to PCM
-          size_t pcm_size = bytesRead / 2;  // 32-bit to 16-bit
-          uint8_t* pcm_buffer = new uint8_t[pcm_size];
-          convert_i2s_to_pcm(audioBuffer, pcm_buffer, bytesRead);
-
-          // Create WAV header
-          wav_header_t wav_header;
-          wav_header.data_chunk_size = pcm_size;
-          wav_header.chunk_size = pcm_size + 36;  // data size + header size - 8
-
-          // Create final buffer with header + PCM data
-          size_t total_size = sizeof(wav_header) + pcm_size;
-          uint8_t* wav_buffer = new uint8_t[total_size];
-          memcpy(wav_buffer, &wav_header, sizeof(wav_header));
-          memcpy(wav_buffer + sizeof(wav_header), pcm_buffer, pcm_size);
-
-          // Send to server
-          HTTPClient http;
-          http.begin(serverUrl);
-          http.addHeader("Content-Type", "audio/wav");
-          http.addHeader("Content-Length", String(total_size));
-          int code = http.POST(wav_buffer, total_size);
-          
-          // Clean up
-          delete[] pcm_buffer;
-          delete[] wav_buffer;
-
-          if (code == 200) {
-              serverResponse = http.getString();
-          } else {
-              serverResponse = "HTTP err:" + String(code);
-              // Mark server as not ready if we get an error
-              serverReady = false;
+      // Wrap long text
+      if (lastTranscription.length() > 21) {
+        display.println(lastTranscription.substring(0, 21));
+        if (lastTranscription.length() > 42) {
+          display.println(lastTranscription.substring(21, 42));
+          if (lastTranscription.length() > 63) {
+            display.println(lastTranscription.substring(42, 63));
           }
-          http.end();
+        } else {
+          display.println(lastTranscription.substring(21));
+        }
       } else {
-          serverResponse = "WiFi lost";
-          serverReady = false;
+        display.println(lastTranscription);
       }
-      Serial.println("Resp: " + serverResponse);
-
-      stateTimestamp = millis();
-      state = SHOW_RESULT;
       break;
-    }
+
+    case ERROR_STATE:
+      display.println("ERROR");
+      display.println(statusMessage);
+      break;
+  }
+  
+      display.display();
+}
+
+void loop() {
+  // Handle WebSocket events
+  webSocket.loop();
+  
+  // Handle button input
+  handleButton();
+  
+  // Stream audio if recording
+  if (state == RECORDING) {
+    streamAudioChunk();
+  }
+  
+  // State machine
+  switch(state) {
+    case CONNECTING_WIFI:
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("WiFi connected!");
+        Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+        state = CONNECTING_WEBSOCKET;
+        setupWebSocket();
+      } else if (millis() - stateTimestamp > 30000) {
+        // WiFi timeout after 30 seconds
+        Serial.println("WiFi connection timeout");
+        state = ERROR_STATE;
+        statusMessage = "WiFi Timeout";
+      }
+      break;
+      
+    case CONNECTING_WEBSOCKET:
+      if (webSocketConnected) {
+        state = IDLE;
+        Serial.println("Ready for voice recording");
+      } else if (millis() - stateTimestamp > 15000) {
+        // WebSocket timeout after 15 seconds
+        Serial.println("WebSocket connection timeout");
+        state = ERROR_STATE;
+        statusMessage = "Server Timeout";
+      }
+      break;
+      
+    case IDLE:
+      // Check connection health
+      if (!webSocketConnected && millis() - lastReconnectAttempt > RECONNECT_INTERVAL) {
+        Serial.println("Attempting WebSocket reconnection...");
+        setupWebSocket();
+        lastReconnectAttempt = millis();
+      }
+      break;
+      
+    case RECORDING:
+      // Recording handled in streamAudioChunk()
+      break;
 
     case SHOW_RESULT:
-      display.clearDisplay();
-      display.setCursor(0,0);
-      display.println("Server:");
-      display.setCursor(0,16);
-      display.println(serverResponse);
-      display.display();
-
-      // after 3 seconds go back to IDLE
+      // Show result for 3 seconds
       if (millis() - stateTimestamp > 3000) {
         state = IDLE;
       }
       break;
-  }
-
-  // Safety check: if we're stuck in recording for too long, reset
-  if (state == RECORDING && millis() - buttonPressTime > 10000) {
-    Serial.println("Safety timeout - resetting to IDLE");
-    state = IDLE;
-    buttonPressed = false;
+      
+    case ERROR_STATE:
+      // Try to recover after 5 seconds
+      if (millis() - stateTimestamp > 5000) {
+        if (WiFi.status() != WL_CONNECTED) {
+          startWiFiConnection();
+        } else {
+          state = CONNECTING_WEBSOCKET;
+          setupWebSocket();
+        }
+        stateTimestamp = millis();
+      }
+      break;
   }
   
-  // tiny idle delay so we don't starve I2S or WDT
+  // Update display
+  updateDisplay();
+  
+  // Small delay to prevent watchdog timeout
   delay(10);
 }
