@@ -113,7 +113,7 @@ void convert_i2s_to_pcm(const uint8_t* i2s_data, uint8_t* pcm_data, size_t size)
 }
 ```
 
-### Server Improvements: FastAPI Upgrade
+### Server Side Improvements: FastAPI Upgrade
 
 Flask was fine for prototyping, but I wanted something more robust. Enter FastAPI:
 
@@ -144,7 +144,7 @@ Remember that 16kHz upgrade? Well, 256KB buffers on an ESP32 are... ambitious. T
 **The diagnosis:**
 Not enough RAM for large static buffers.
 
-### Design Decision #3: The WebSocket Revolution
+### Design Decision #3: The WebSocket
 
 This is where the project took a major turn. Instead of thinking "bigger buffers," I thought "no buffers!" 
 
