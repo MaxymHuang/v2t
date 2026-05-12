@@ -4,7 +4,7 @@ import logging
 import tempfile
 import os
 import soundfile as sf
-from custom_whisper_inference import transcribe_with_custom_model
+from custom_whisper_inference import transcribe_with_custom_model, get_custom_model
 import wave
 import numpy as np
 import time
@@ -262,14 +262,17 @@ def initialize_custom_model():
     """Initialize the custom Whisper model on first use"""
     global custom_model_initialized
     if not custom_model_initialized:
-        logger.info("Initializing custom Whisper model...")
+        logger.info("Initializing Whisper model...")
         try:
-            # Test the custom model to ensure it loads properly
-            test_result = transcribe_with_custom_model("test_audio.wav")  # This will fail but tests loading
-            logger.info("Custom Whisper model initialized successfully")
-            custom_model_initialized = True
+            model = get_custom_model()
+            if model.model is not None:
+                label = "fallback" if model.using_fallback else "custom"
+                logger.info(f"Whisper model initialized successfully ({label})")
+                custom_model_initialized = True
+            else:
+                logger.error("Model object exists but model failed to load")
         except Exception as e:
-            logger.error(f"Failed to initialize custom model: {e}")
+            logger.error(f"Failed to initialize model: {e}")
             custom_model_initialized = False
 
 def is_valid_audio(file_path):
@@ -544,6 +547,73 @@ async def websocket_audio_endpoint(websocket: WebSocket, client_id: str):
                                 "timestamp": datetime.datetime.now().isoformat()
                             }))
                             
+                        elif command == "log_file_start":
+                            # Handle start of log file transfer
+                            filename = data.get("filename", "unknown.log")
+                            file_size = data.get("file_size", 0)
+                            timestamp = data.get("timestamp", 0)
+                            
+                            logger.info(f"Starting log file transfer from {client_id}: {filename} ({file_size} bytes)")
+                            
+                            # Initialize log file transfer state
+                            if not hasattr(audio_manager, 'log_transfers'):
+                                audio_manager.log_transfers = {}
+                            
+                            audio_manager.log_transfers[client_id] = {
+                                "filename": filename,
+                                "expected_size": file_size,
+                                "received_size": 0,
+                                "chunks": [],
+                                "start_time": datetime.datetime.now(),
+                                "esp32_timestamp": timestamp
+                            }
+                            
+                        elif command == "log_file_chunk":
+                            # Handle log file chunk
+                            if hasattr(audio_manager, 'log_transfers') and client_id in audio_manager.log_transfers:
+                                chunk_text = data.get("chunk_text", "")
+                                chunk_size = data.get("chunk_size", 0)
+                                total_sent = data.get("total_sent", 0)
+                                
+                                transfer = audio_manager.log_transfers[client_id]
+                                transfer["chunks"].append(chunk_text)
+                                transfer["received_size"] = total_sent
+                                
+                                logger.debug(f"Log chunk from {client_id}: {chunk_size} bytes (total: {total_sent})")
+                            
+                        elif command == "log_file_complete":
+                            # Handle log file transfer completion
+                            if hasattr(audio_manager, 'log_transfers') and client_id in audio_manager.log_transfers:
+                                transfer = audio_manager.log_transfers[client_id]
+                                total_bytes = data.get("total_bytes", 0)
+                                success = data.get("success", False)
+                                
+                                if success:
+                                    # Reconstruct complete log file
+                                    complete_log = "".join(transfer["chunks"])
+                                    
+                                    # Save log file to disk
+                                    log_filename = f"i2s_monitor_{client_id}_{transfer['esp32_timestamp']}.log"
+                                    log_path = os.path.join("logs", log_filename)
+                                    
+                                    # Create logs directory if it doesn't exist
+                                    os.makedirs("logs", exist_ok=True)
+                                    
+                                    with open(log_path, 'w') as f:
+                                        f.write(complete_log)
+                                    
+                                    logger.info(f"Log file saved: {log_path} ({total_bytes} bytes)")
+                                    logger.info(f"Log transfer completed in {datetime.datetime.now() - transfer['start_time']}")
+                                    
+                                    # Log some key analysis results
+                                    if "VERIFICATION:" in complete_log:
+                                        verification_line = [line for line in complete_log.split('\n') if "VERIFICATION:" in line]
+                                        if verification_line:
+                                            logger.info(f"I2S Analysis Result: {verification_line[0].strip()}")
+                                
+                                # Clean up transfer state
+                                del audio_manager.log_transfers[client_id]
+                            
                     except json.JSONDecodeError:
                         await websocket.send_text(json.dumps({
                             "type": "error",
@@ -572,6 +642,104 @@ async def websocket_status():
             for client_id in audio_manager.connections.keys()
         }
     })
+
+@app.post("/ws/request_log/{client_id}")
+async def request_log_file(client_id: str):
+    """Request log file from ESP32 client"""
+    if client_id not in audio_manager.connections:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": f"Client {client_id} not connected"}
+        )
+    
+    try:
+        # Send log file request to ESP32
+        websocket = audio_manager.connections[client_id]
+        request_message = {
+            "type": "command", 
+            "command": "get_log_file"
+        }
+        await websocket.send_text(json.dumps(request_message))
+        
+        return JSONResponse(content={
+            "status": "success",
+            "message": f"Log file request sent to {client_id}"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error requesting log file from {client_id}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to request log file: {str(e)}"}
+        )
+
+@app.get("/logs")
+async def list_log_files():
+    """List all received I2S monitor log files"""
+    log_dir = "logs"
+    
+    if not os.path.exists(log_dir):
+        return JSONResponse(content={
+            "status": "success",
+            "log_files": [],
+            "message": "No log directory found"
+        })
+    
+    try:
+        log_files = []
+        for filename in os.listdir(log_dir):
+            if filename.endswith('.log'):
+                file_path = os.path.join(log_dir, filename)
+                file_stat = os.stat(file_path)
+                
+                log_files.append({
+                    "filename": filename,
+                    "size": file_stat.st_size,
+                    "created": datetime.datetime.fromtimestamp(file_stat.st_ctime).isoformat(),
+                    "modified": datetime.datetime.fromtimestamp(file_stat.st_mtime).isoformat()
+                })
+        
+        # Sort by creation time (newest first)
+        log_files.sort(key=lambda x: x["created"], reverse=True)
+        
+        return JSONResponse(content={
+            "status": "success",
+            "log_files": log_files,
+            "total_files": len(log_files)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error listing log files: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to list log files: {str(e)}"}
+        )
+
+@app.get("/logs/{filename}")
+async def get_log_file(filename: str):
+    """Download a specific log file"""
+    log_path = os.path.join("logs", filename)
+    
+    if not os.path.exists(log_path) or not filename.endswith('.log'):
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "Log file not found"}
+        )
+    
+    try:
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            path=log_path,
+            filename=filename,
+            media_type='text/plain'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error serving log file {filename}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to serve log file: {str(e)}"}
+        )
 
 @app.post("/voice_to_text")
 async def voice_to_text(request: Request):

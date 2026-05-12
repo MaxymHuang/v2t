@@ -7,55 +7,62 @@ import torch
 import librosa
 import soundfile as sf
 import numpy as np
+import os
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 import warnings
 warnings.filterwarnings("ignore")
 
+FALLBACK_MODEL = "openai/whisper-tiny"
+
 class CustomWhisperModel:
     def __init__(self, model_path="./custom_model"):
-        self.model_path = model_path
+        self.model_path = os.path.abspath(model_path)
         self.model = None
         self.processor = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.using_fallback = False
         
         self.load_model()
     
+    def _load_from(self, source, label):
+        """Load processor and model from a given source (local path or HF repo)."""
+        print(f"Loading {label} from {source}")
+        self.processor = WhisperProcessor.from_pretrained(
+            source, language="english", task="transcribe"
+        )
+        self.model = WhisperForConditionalGeneration.from_pretrained(
+            source,
+            torch_dtype=torch.float32,
+            device_map="auto" if self.device == "cuda" else None,
+        )
+        self.model.config.forced_decoder_ids = None
+        self.model.config.suppress_tokens = []
+        self.model.config.use_cache = True
+        self.model.eval()
+
     def load_model(self):
-        """Load custom trained model"""
+        """Load custom trained model, falling back to whisper-tiny if unavailable."""
         try:
-            print(f"Loading custom model from {self.model_path}")
-            
-            # Load processor
-            self.processor = WhisperProcessor.from_pretrained(
-                self.model_path,
-                language="english",
-                task="transcribe"
-            )
-            
-            # Load model
-            self.model = WhisperForConditionalGeneration.from_pretrained(
-                self.model_path,
-                torch_dtype=torch.float32,
-                device_map="auto" if self.device == "cuda" else None
-            )
-            
-            # Configure for inference
-            self.model.config.forced_decoder_ids = None
-            self.model.config.suppress_tokens = []
-            self.model.config.use_cache = True
-            self.model.eval()
-            
-            print(f"Custom model loaded successfully")
+            if os.path.isdir(self.model_path):
+                self._load_from(self.model_path, "custom model")
+                self.using_fallback = False
+            else:
+                print(f"Custom model directory not found: {self.model_path}")
+                print(f"Falling back to {FALLBACK_MODEL}")
+                self._load_from(FALLBACK_MODEL, "fallback model")
+                self.using_fallback = True
+
+            print(f"Model loaded successfully (fallback={self.using_fallback})")
             print(f"Device: {self.device}")
-            
+
             if torch.cuda.is_available():
                 memory_mb = torch.cuda.memory_allocated(0) / 1e6
                 print(f"GPU Memory: {memory_mb:.0f} MB")
-            
+
             return True
-            
+
         except Exception as e:
-            print(f"Error loading custom model: {e}")
+            print(f"Error loading model: {e}")
             return False
     
     def transcribe_audio(self, audio_data, sample_rate=16000):
