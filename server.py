@@ -62,6 +62,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# ESP32 WebSocket buffer limit
+WS_MAX_MSG_SIZE = 512
+WS_CHUNK_TEXT_SIZE = 400  # safe text payload per chunk (512 minus JSON overhead)
+
 # WebSocket Audio Stream Manager
 class AudioStreamManager:
     def __init__(self):
@@ -88,7 +92,40 @@ class AudioStreamManager:
         if client_id in self.is_recording:
             del self.is_recording[client_id]
         logger.info(f"WebSocket client {client_id} disconnected")
-        
+
+    async def send_transcription(self, client_id: str, transcription: str):
+        """Send transcription to client, chunking if it exceeds the ESP32 buffer limit."""
+        if client_id not in self.connections:
+            return
+
+        ws = self.connections[client_id]
+        ts = datetime.datetime.now().isoformat()
+
+        single_msg = json.dumps({
+            "type": "transcription", "text": transcription, "timestamp": ts
+        })
+
+        if len(single_msg.encode("utf-8")) <= WS_MAX_MSG_SIZE:
+            await ws.send_text(single_msg)
+            return
+
+        chunks = [
+            transcription[i:i + WS_CHUNK_TEXT_SIZE]
+            for i in range(0, len(transcription), WS_CHUNK_TEXT_SIZE)
+        ]
+        total = len(chunks)
+        logger.info(f"Transcription too large for single message, splitting into {total} chunks")
+
+        await ws.send_text(json.dumps({
+            "type": "transcription_start", "total_chunks": total, "timestamp": ts
+        }))
+
+        for idx, chunk_text in enumerate(chunks):
+            msg_type = "transcription_end" if idx == total - 1 else "transcription_chunk"
+            await ws.send_text(json.dumps({
+                "type": msg_type, "chunk_index": idx, "text": chunk_text
+            }))
+
     async def handle_audio_chunk(self, client_id: str, audio_data: bytes):
         """Handle incoming audio chunk from ESP32"""
         if client_id not in self.audio_buffers:
@@ -217,13 +254,8 @@ class AudioStreamManager:
                     transcription = transcribe_with_custom_model(preprocessed_file)
                     logger.info(f"Transcription completed: '{transcription}'")
                     
-                    # Send result back to client
-                    if client_id in self.connections:
-                        await self.connections[client_id].send_text(json.dumps({
-                            "type": "transcription",
-                            "text": transcription,
-                            "timestamp": datetime.datetime.now().isoformat()
-                        }))
+                    # Send result back to client (chunked if needed for ESP32 buffer)
+                    await self.send_transcription(client_id, transcription)
                         
                     # Save for training
                     if not transcription.startswith("ERROR:") and transcription:
