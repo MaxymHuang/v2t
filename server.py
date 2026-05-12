@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 import logging
@@ -15,6 +16,10 @@ import json
 from typing import Dict, List
 import io
 
+# CPU-optimized configuration for i7-8700
+os.environ["OMP_NUM_THREADS"] = "6"
+os.environ["MKL_NUM_THREADS"] = "6"
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -24,17 +29,38 @@ logging.getLogger('numba').setLevel(logging.WARNING)
 logging.getLogger('librosa').setLevel(logging.WARNING)
 logging.getLogger('transformers').setLevel(logging.WARNING)
 
-# Initialize FastAPI app and Whisper model
-app = FastAPI()
-
-# CPU-optimized configuration for i7-8700
-import os
-os.environ["OMP_NUM_THREADS"] = "6"  # Use 6 cores for OpenMP
-os.environ["MKL_NUM_THREADS"] = "6"  # Intel MKL optimization
-
-# Initialize custom Whisper model
-# The custom model will be loaded when first used
 custom_model_initialized = False
+
+def initialize_custom_model():
+    """Initialize the Whisper model."""
+    global custom_model_initialized
+    if not custom_model_initialized:
+        logger.info("Initializing Whisper model...")
+        try:
+            model = get_custom_model()
+            if model.model is not None:
+                label = "fallback" if model.using_fallback else "custom"
+                logger.info(f"Whisper model initialized successfully ({label})")
+                custom_model_initialized = True
+            else:
+                logger.error("Model object exists but model failed to load")
+        except Exception as e:
+            logger.error(f"Failed to initialize model: {e}")
+            custom_model_initialized = False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load the Whisper model before accepting connections."""
+    global custom_model_initialized
+    logger.info("Loading Whisper model at startup...")
+    initialize_custom_model()
+    if custom_model_initialized:
+        logger.info("Server ready — model loaded.")
+    else:
+        logger.warning("Server starting with NO working model.")
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # WebSocket Audio Stream Manager
 class AudioStreamManager:
@@ -257,23 +283,6 @@ def save_audio_for_training(audio_file_path, transcribed_text, sample_rate):
     except Exception as e:
         logger.error(f"Failed to save training audio: {e}")
         return None
-
-def initialize_custom_model():
-    """Initialize the custom Whisper model on first use"""
-    global custom_model_initialized
-    if not custom_model_initialized:
-        logger.info("Initializing Whisper model...")
-        try:
-            model = get_custom_model()
-            if model.model is not None:
-                label = "fallback" if model.using_fallback else "custom"
-                logger.info(f"Whisper model initialized successfully ({label})")
-                custom_model_initialized = True
-            else:
-                logger.error("Model object exists but model failed to load")
-        except Exception as e:
-            logger.error(f"Failed to initialize model: {e}")
-            custom_model_initialized = False
 
 def is_valid_audio(file_path):
     try:
