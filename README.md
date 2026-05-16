@@ -91,9 +91,9 @@ cp .env.example .env
 docker compose up -d
 ```
 
-- Default model: `nvidia/Qwen3-30B-A3B-NVFP4` (downloaded and converted to GGUF on first start; ~15 GB+ disk).
+- Default model: `unsloth/Qwen2.5-3B-Instruct-unsloth-bnb-4bit` (downloaded and converted to GGUF on first start; ~3–8 GB disk depending on output type).
 - Health check: `curl http://localhost:9990/health`
-- If NVFP4 conversion fails, set `HF_GGUF_REPO` and `HF_GGUF_FILE` in `inference/.env` (see `.env.example`).
+- If conversion fails, set `HF_GGUF_REPO` and `HF_GGUF_FILE` in `inference/.env` (see `.env.example`).
 
 On the v2t host, set `INFERENCE_URL=http://<gpu-host>:9990`. The ESP32 shows **Thinking...** then the **LLM reply** only (no raw transcription on the OLED).
 

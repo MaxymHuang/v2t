@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-GGUF_PATH="${GGUF_PATH:-/models/qwen3-30b-a3b-nvfp4.gguf}"
+GGUF_PATH="${GGUF_PATH:-/models/qwen2.5-3b-instruct.gguf}"
 LLAMA_PORT="${LLAMA_PORT:-9990}"
 LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-8192}"
 LLAMA_NGL="${LLAMA_NGL:-99}"

@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-HF_MODEL_ID="${HF_MODEL_ID:-nvidia/Qwen3-30B-A3B-NVFP4}"
-GGUF_PATH="${GGUF_PATH:-/models/qwen3-30b-a3b-nvfp4.gguf}"
+HF_MODEL_ID="${HF_MODEL_ID:-unsloth/Qwen2.5-3B-Instruct-unsloth-bnb-4bit}"
+GGUF_PATH="${GGUF_PATH:-/models/qwen2.5-3b-instruct.gguf}"
 HF_DIR="${HF_DIR:-/models/hf_source}"
 if [[ -z "${CONVERT_SCRIPT:-}" ]]; then
   CONVERT_SCRIPT="$(find /app -name 'convert_hf_to_gguf.py' 2>/dev/null | head -1)"
@@ -16,7 +16,7 @@ if [[ -f "$GGUF_PATH" ]]; then
   exit 0
 fi
 
-# Optional: download a ready-made GGUF instead of converting NVFP4 safetensors
+# Optional: download a ready-made GGUF instead of converting safetensors
 if [[ -n "${HF_GGUF_REPO:-}" && -n "${HF_GGUF_FILE:-}" ]]; then
   echo "Downloading GGUF ${HF_GGUF_REPO}/${HF_GGUF_FILE} ..."
   pip install -q --no-cache-dir "huggingface_hub[cli]"
