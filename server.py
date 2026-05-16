@@ -6,6 +6,7 @@ import tempfile
 import os
 import soundfile as sf
 from custom_whisper_inference import transcribe_with_custom_model, get_custom_model
+from llm_client import infer_assistant_response, inference_configured
 import wave
 import numpy as np
 import time
@@ -93,8 +94,26 @@ class AudioStreamManager:
             del self.is_recording[client_id]
         logger.info(f"WebSocket client {client_id} disconnected")
 
-    async def send_transcription(self, client_id: str, transcription: str):
-        """Send transcription to client, chunking if it exceeds the ESP32 buffer limit."""
+    async def send_status(self, client_id: str, message: str):
+        """Send a status update to the client."""
+        if client_id not in self.connections:
+            return
+        await self.connections[client_id].send_text(json.dumps({
+            "type": "status",
+            "message": message,
+            "timestamp": datetime.datetime.now().isoformat(),
+        }))
+
+    async def _send_chunked_text(
+        self,
+        client_id: str,
+        text: str,
+        single_type: str,
+        start_type: str,
+        chunk_type: str,
+        end_type: str,
+    ):
+        """Send text to ESP32, chunking if it exceeds the WebSocket buffer limit."""
         if client_id not in self.connections:
             return
 
@@ -102,7 +121,7 @@ class AudioStreamManager:
         ts = datetime.datetime.now().isoformat()
 
         single_msg = json.dumps({
-            "type": "transcription", "text": transcription, "timestamp": ts
+            "type": single_type, "text": text, "timestamp": ts
         })
 
         if len(single_msg.encode("utf-8")) <= WS_MAX_MSG_SIZE:
@@ -110,21 +129,34 @@ class AudioStreamManager:
             return
 
         chunks = [
-            transcription[i:i + WS_CHUNK_TEXT_SIZE]
-            for i in range(0, len(transcription), WS_CHUNK_TEXT_SIZE)
+            text[i:i + WS_CHUNK_TEXT_SIZE]
+            for i in range(0, len(text), WS_CHUNK_TEXT_SIZE)
         ]
         total = len(chunks)
-        logger.info(f"Transcription too large for single message, splitting into {total} chunks")
+        logger.info(
+            f"{single_type} too large for single message, splitting into {total} chunks"
+        )
 
         await ws.send_text(json.dumps({
-            "type": "transcription_start", "total_chunks": total, "timestamp": ts
+            "type": start_type, "total_chunks": total, "timestamp": ts
         }))
 
         for idx, chunk_text in enumerate(chunks):
-            msg_type = "transcription_end" if idx == total - 1 else "transcription_chunk"
+            msg_type = end_type if idx == total - 1 else chunk_type
             await ws.send_text(json.dumps({
                 "type": msg_type, "chunk_index": idx, "text": chunk_text
             }))
+
+    async def send_llm_response(self, client_id: str, text: str):
+        """Send LLM reply to client (only result type shown on ESP32)."""
+        await self._send_chunked_text(
+            client_id,
+            text,
+            single_type="llm_response",
+            start_type="llm_response_start",
+            chunk_type="llm_response_chunk",
+            end_type="llm_response_end",
+        )
 
     async def handle_audio_chunk(self, client_id: str, audio_data: bytes):
         """Handle incoming audio chunk from ESP32"""
@@ -253,10 +285,26 @@ class AudioStreamManager:
                     logger.info("Starting Whisper transcription...")
                     transcription = transcribe_with_custom_model(preprocessed_file)
                     logger.info(f"Transcription completed: '{transcription}'")
-                    
-                    # Send result back to client (chunked if needed for ESP32 buffer)
-                    await self.send_transcription(client_id, transcription)
-                        
+
+                    if not inference_configured():
+                        logger.warning("INFERENCE_URL not set; cannot send LLM response to ESP32")
+                        if client_id in self.connections:
+                            await self.connections[client_id].send_text(json.dumps({
+                                "type": "error",
+                                "message": "Inference not configured (set INFERENCE_URL)",
+                            }))
+                    else:
+                        await self.send_status(client_id, "Thinking...")
+                        if transcription.startswith("ERROR:") or not transcription.strip():
+                            await self.send_llm_response(
+                                client_id,
+                                transcription or "ERROR: no speech detected",
+                            )
+                        else:
+                            reply = await infer_assistant_response(transcription)
+                            logger.info(f"LLM reply: '{reply}'")
+                            await self.send_llm_response(client_id, reply)
+
                     # Save for training
                     if not transcription.startswith("ERROR:") and transcription:
                         save_audio_for_training(preprocessed_file, transcription, self.sample_rates[client_id])

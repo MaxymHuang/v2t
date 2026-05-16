@@ -55,3 +55,7 @@ Thumbs.db
 custom_model/
 
 training/
+
+# LLM inference (Docker volumes / local env)
+inference/.env
+inference/models/

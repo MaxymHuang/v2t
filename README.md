@@ -69,8 +69,33 @@ A voice recognition system using ESP32 microcontroller with I2S microphone that 
 
 3. **Start Development Server:**
    ```bash
+   # Point at remote llama.cpp server (required for ESP32 voice replies)
+   set INFERENCE_URL=http://<gpu-host>:9990   # Windows
+   # export INFERENCE_URL=http://<gpu-host>:9990   # Linux/macOS
    python server.py
    ```
+
+### LLM inference server (port 9990)
+
+Deploy on a **Linux machine with an NVIDIA GPU** and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html):
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi
+```
+
+```bash
+cd inference
+cp .env.example .env
+docker compose up -d
+```
+
+- Default model: `nvidia/Qwen3-30B-A3B-NVFP4` (downloaded and converted to GGUF on first start; ~15 GB+ disk).
+- Health check: `curl http://localhost:9990/health`
+- If NVFP4 conversion fails, set `HF_GGUF_REPO` and `HF_GGUF_FILE` in `inference/.env` (see `.env.example`).
+
+On the v2t host, set `INFERENCE_URL=http://<gpu-host>:9990`. The ESP32 shows **Thinking...** then the **LLM reply** only (no raw transcription on the OLED).
 
 ### Production Deployment
 
@@ -103,7 +128,7 @@ See `README_PRODUCTION.md` for complete production deployment guide.
 
 1. Press and hold the button to start recording
 2. Release the button to stop recording  
-3. Wait for transcription result on OLED display
+3. Wait for the assistant reply on the OLED display
 4. Audio is streamed in real-time via WebSocket for faster processing
 
 ## Project Structure
@@ -117,6 +142,8 @@ v2t/
 ├── custom_model/                 # Custom trained model files
 ├── training/                     # Collected training data (dev only)
 ├── requirements.txt              # Python dependencies
+├── llm_client.py                 # llama.cpp inference client
+├── inference/                    # GPU llama-server (port 9990, NVIDIA CTK)
 ├── Dockerfile                    # Development Docker setup
 ├── Dockerfile.production         # Production Docker setup
 ├── docker-compose.production.yml # Production deployment

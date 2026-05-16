@@ -26,6 +26,7 @@ scipy>=1.7.0
 # Benchmark dependencies
 psutil
 requests
+httpx
 statistics
 
 # Optional: GPU support (uncomment if using CUDA)

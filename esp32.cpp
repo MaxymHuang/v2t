@@ -58,8 +58,10 @@ enum State {
 };
 State state = CONNECTING_WIFI;
 uint32_t stateTimestamp = 0;
-String   lastTranscription = "";
+String   lastResponse = "";
 String   statusMessage = "";
+String   llmChunkBuffer = "";
+int      llmExpectedChunks = 0;
 
 // Audio streaming
 uint8_t audioChunk[CHUNK_SIZE];
@@ -214,25 +216,44 @@ void handleWebSocketMessage(const char* message) {
   
   String type = doc["type"];
   
-  if (type == "transcription") {
-    String text = doc["text"];
-    lastTranscription = text;
-    Serial.printf("Transcription received: %s\n", text.c_str());
-    
-    // Show result
+  if (type == "llm_response") {
+    lastResponse = doc["text"].as<String>();
+    llmChunkBuffer = "";
+    llmExpectedChunks = 0;
+    Serial.printf("LLM response: %s\n", lastResponse.c_str());
     state = SHOW_RESULT;
     stateTimestamp = millis();
-    
+
+  } else if (type == "llm_response_start") {
+    llmExpectedChunks = doc["total_chunks"] | 0;
+    llmChunkBuffer = "";
+  } else if (type == "llm_response_chunk") {
+    llmChunkBuffer += doc["text"].as<String>();
+  } else if (type == "llm_response_end") {
+    llmChunkBuffer += doc["text"].as<String>();
+    lastResponse = llmChunkBuffer;
+    llmChunkBuffer = "";
+    llmExpectedChunks = 0;
+    Serial.printf("LLM response (chunked): %s\n", lastResponse.c_str());
+    state = SHOW_RESULT;
+    stateTimestamp = millis();
+
   } else if (type == "status") {
-    String message = doc["message"];
-    statusMessage = message;
-    Serial.printf("Status: %s\n", message.c_str());
-    
+    statusMessage = doc["message"].as<String>();
+    Serial.printf("Status: %s\n", statusMessage.c_str());
+    if (statusMessage == "Thinking...") {
+      lastResponse = "";
+      state = SHOW_RESULT;
+      stateTimestamp = millis();
+    }
+
   } else if (type == "error") {
     String errorMsg = doc["message"];
     Serial.printf("Server error: %s\n", errorMsg.c_str());
     statusMessage = "Error: " + errorMsg;
-    
+    state = ERROR_STATE;
+    stateTimestamp = millis();
+
   } else if (type == "pong") {
     Serial.println("Ping response received");
   }
@@ -456,22 +477,23 @@ void updateDisplay() {
       break;
       
     case SHOW_RESULT:
-      display.println("Result:");
-      display.println("--------");
-
-      // Wrap long text
-      if (lastTranscription.length() > 21) {
-        display.println(lastTranscription.substring(0, 21));
-        if (lastTranscription.length() > 42) {
-          display.println(lastTranscription.substring(21, 42));
-          if (lastTranscription.length() > 63) {
-            display.println(lastTranscription.substring(42, 63));
+      if (lastResponse.length() == 0) {
+        display.println("Thinking...");
+      } else {
+        display.println("Reply:");
+        if (lastResponse.length() > 21) {
+          display.println(lastResponse.substring(0, 21));
+          if (lastResponse.length() > 42) {
+            display.println(lastResponse.substring(21, 42));
+            if (lastResponse.length() > 63) {
+              display.println(lastResponse.substring(42, 63));
+            }
+          } else {
+            display.println(lastResponse.substring(21));
           }
         } else {
-          display.println(lastTranscription.substring(21));
+          display.println(lastResponse);
         }
-      } else {
-        display.println(lastTranscription);
       }
       break;
 
@@ -538,8 +560,8 @@ void loop() {
       break;
 
     case SHOW_RESULT:
-      // Show result for 3 seconds
-      if (millis() - stateTimestamp > 3000) {
+      // Show reply for 10s; stay on "Thinking..." until llm_response arrives
+      if (lastResponse.length() > 0 && millis() - stateTimestamp > 10000) {
         state = IDLE;
       }
       break;

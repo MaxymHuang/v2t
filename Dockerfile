@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the app code into the container
-COPY server.py .
+COPY server.py llm_client.py custom_whisper_inference.py ./
 
 # Expose the port Flask will use
 EXPOSE 5000

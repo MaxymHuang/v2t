@@ -1,0 +1,47 @@
+services:
+  model-init:
+    image: ghcr.io/ggml-org/llama.cpp:full-cuda
+    entrypoint: ["/bin/bash", "/scripts/init_model.sh"]
+    env_file:
+      - .env
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./scripts:/scripts:ro
+      - model-data:/models
+    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  llm:
+    build: .
+    ports:
+      - "${LLAMA_PORT:-9990}:9990"
+    env_file:
+      - .env
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - model-data:/models:ro
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  model-data:
